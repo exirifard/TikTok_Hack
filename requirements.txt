@@ -1,0 +1,7 @@
+python-dotenv
+tqdm
+yt-dlp[default,curl-cffi]
+curl_cffi
+requests
+pandas
+playwright
