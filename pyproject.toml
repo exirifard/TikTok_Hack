@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tiktok-collector"
+version = "1.5.0"
+description = "Batch-friendly TikTok Collector CLI (scrape → metadata → download)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }  # change if you prefer another license
+authors = [
+  { name = "Qasem Exirifard", email = "Qasem.Exirifard@international.gc.ca" },
+]
+keywords = ["tiktok", "scraping", "cli", "metadata", "playwright", "yt-dlp"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: GAC License",
+  "Topic :: Internet :: WWW/HTTP",
+  "Topic :: Multimedia :: Video",
+  "Topic :: Utilities",
+]
+
+dependencies = [
+  "python-dotenv",
+  "tqdm",
+  "yt-dlp[default,curl-cffi]",
+  "curl_cffi",
+  "requests",
+  "pandas",
+  "playwright",
+]
+
+[project.scripts]
+tiktok-tool = "tiktok_tool:main"
+
+[tool.setuptools]
+py-modules = ["tiktok_tool"]
