@@ -37,6 +37,7 @@ dependencies = [
   "requests",
   "pandas",
   "playwright",
+  "geopy"
 ]
 
 [project.scripts]
