@@ -230,6 +230,128 @@ def parse_count(maybe: Optional[str]) -> Optional[int]:
 
 # ───────────────────────────── I/O helpers & templates ───────────────────────
 
+
+
+import math
+import random
+
+def jitter_coordinates(
+    lat: float | None,
+    lon: float | None,
+    radius_m: float,
+) -> tuple[float | None, float | None]:
+    """
+    Add random jitter up to `radius_m` meters around (lat, lon).
+
+    Uses a uniform distribution over the disk (not just radius).
+    """
+    if lat is None or lon is None or radius_m <= 0:
+        return lat, lon
+
+    # Convert meters to km, then to radians over Earth radius
+    R_earth_km = 6371.0
+    radius_km = radius_m / 1000.0
+
+    # Pick random distance and bearing
+    # d in [0, radius_km], weighted so points are uniform inside circle
+    d = radius_km * math.sqrt(random.random())
+    bearing = 2 * math.pi * random.random()
+
+    lat1 = math.radians(lat)
+    lon1 = math.radians(lon)
+
+    # Move d km along the bearing
+    lat2 = math.asin(
+        math.sin(lat1) * math.cos(d / R_earth_km)
+        + math.cos(lat1) * math.sin(d / R_earth_km) * math.cos(bearing)
+    )
+    lon2 = lon1 + math.atan2(
+        math.sin(bearing) * math.sin(d / R_earth_km) * math.cos(lat1),
+        math.cos(d / R_earth_km) - math.sin(lat1) * math.sin(lat2),
+    )
+
+    # Normalize lon to [-180, 180]
+    lon2 = (math.degrees(lon2) + 540) % 360 - 180
+    lat2 = math.degrees(lat2)
+
+    return lat2, lon2
+
+from geopy.geocoders import Nominatim
+
+def geocode_city(city: str, state: str=None, country: str=None)-> tuple[float | None, float | None]:
+    """
+    Returns (latitude, longitude) for a given city, state/province, and country.
+    If state or country is missing, the function progressively falls back.
+    """
+    geolocator = Nominatim(user_agent="geo_lookup")
+
+    # Build possible query combinations from most specific → least specific
+    queries = []
+
+    if city and state and country:
+        queries.append(f"{city}, {state}, {country}")
+    if city and state:
+        queries.append(f"{city}, {state}")
+    if city and country:
+        queries.append(f"{city}, {country}")
+    if city:
+        queries.append(city)
+
+    # Try each query until one succeeds
+    for query in queries:
+        try:
+            location = geolocator.geocode(query)
+            if location:
+                return (location.latitude, location.longitude)
+        except Exception:
+            continue
+
+    # If nothing matched
+    return None
+
+
+def ensure_lat_lon_from_args(args: argparse.Namespace) -> None:
+    """
+    If args.lat/lon are not set but --city/--country are provided,
+    call geocode_city and fill args.lat / args.lon in place.
+    """
+    if getattr(args, "lat", None) is not None and getattr(args, "lon", None) is not None:
+        # Explicit lat/lon wins
+        return
+
+    city = getattr(args, "city", None)
+    state = getattr(args, "state", None) or getattr(args, "province", None)
+    country = getattr(args, "country", None)
+
+    if not city:
+        return
+
+##
+    coords = geocode_city(city, state, country)
+    if not coords:
+        print(f"⚠️ Could not resolve geolocation for city={city!r}, country={country!r}")
+        return
+
+    lat, lon = coords
+
+    jitter_m = getattr(args, "geo_uncertainty_m", 0.0) or 0.0
+    if jitter_m > 0:
+        j_lat, j_lon = jitter_coordinates(lat, lon, jitter_m)
+        print(
+            f"📍 Resolved location: {city!r} ({country or 'unknown country'}) "
+            f"→ base={lat:.6f},{lon:.6f}, with ±{jitter_m} m jitter → {j_lat:.6f},{j_lon:.6f}"
+        )
+        lat, lon = j_lat, j_lon
+    else:
+        print(
+            f"📍 Resolved location: {city!r} ({country or 'unknown country'}) "
+            f"→ lat={lat:.6f}, lon={lon:.6f}"
+        )
+
+    args.lat = lat
+    args.lon = lon
+
+
 import re
 from urllib.parse import urlparse, parse_qs, unquote
 
@@ -338,8 +460,10 @@ def save_urls_to_csv(
     query: Optional[str] = None,
     scraped_at: Optional[str] = None,
     ip_address: Optional[str] = None,
+    latitude: Optional[float] = None,
+    longitude: Optional[float] = None,
     logger=logger,
-) -> None:
+):
     """
     Robust CSV writer with:
       - full try/except protection
@@ -365,10 +489,14 @@ def save_urls_to_csv(
         query or "",
         scraped_at,
         ip_address or "",
+        latitude if latitude is not None else "",
+        longitude if longitude is not None else "",
     )
+
 
     # Data rows
     rows = [[u, *row_template] for u in urls_list]
+
 
     # Always write atomically: write to tmp first
     tmp_path = filename.with_suffix(filename.suffix + ".tmp")
@@ -376,7 +504,7 @@ def save_urls_to_csv(
     try:
         with open(tmp_path, "w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
-            w.writerow(["url", "search_type", "query", "scraped_at", "ip_address"])
+            w.writerow(["url", "search_type", "query", "scraped_at", "ip_address", "latitude","longitude"])
             w.writerows(rows)
 
         # Atomic replace of original file
@@ -392,7 +520,7 @@ def save_urls_to_csv(
         try:
             with open(fallback, "w", newline="", encoding="utf-8") as f:
                 w = csv.writer(f)
-                w.writerow(["url", "search_type", "query", "scraped_at", "ip_address"])
+                w.writerow(["url", "search_type", "query", "scraped_at", "ip_address","latitude","longitude"])
                 w.writerows(rows)
 
             logger.error(f"Data saved to FALLBACK CSV: {fallback}")
@@ -432,9 +560,12 @@ def write_links_to_sqlite(
     query: str,
     scraped_at: str,
     ip_address: str,
+    latitude: float | None = None,
+    longitude: float | None = None,
     logger=logger,
-    notify_user: bool = False,   # prints to user
+    notify_user: bool = False,
 ) -> None:
+
     """
     Write scraped link URLs into SQLite.
 
@@ -465,23 +596,28 @@ def write_links_to_sqlite(
                     search_type TEXT,
                     query       TEXT,
                     scraped_at  TEXT,
-                    ip_address  TEXT
+                    ip_address  TEXT,
+                    latitude    REAL,
+                    longitude   REAL
                 )
+
                 """
             )
 
             # Build rows for this scrape
             rows = [
-                (u, search_type, query, scraped_at, ip_address)
+                (u, search_type, query, scraped_at, ip_address, latitude, longitude)
                 for u in urls
             ]
+
 
             # Plain INSERT: keep *all* scrapes (no OR IGNORE)
             cur.executemany(
                 """
                 INSERT INTO scrape_links
-                    (url, search_type, query, scraped_at, ip_address)
-                VALUES (?, ?, ?, ?, ?)
+                    (url, search_type, query, scraped_at, ip_address, latitude, longitude)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+
                 """,
                 rows,
             )
@@ -869,30 +1005,110 @@ class TikTokScraperSession:
         user_agent: Optional[str],
         ms_token: Optional[str],
         pause_for_captcha: bool,
+        latitude: float=None,
+        longitude: float=None,
+        geo_accuracy_m: float = 10.0, 
+        device_profile: str = "desktop",
+        device: Optional[str] = None,
+        browser:  Optional[str] ="chromium",
+        persist_cookie_file: Optional[str] = None,
     ):
         self.headless = headless
         self.proxy = proxy
+
         self.user_agent = user_agent
+        self.browser = browser
         self.ms_token = ms_token
         self.pause_for_captcha = pause_for_captcha
+        
+        self.latitude = latitude
+        self.longitude = longitude
+        self.geo_accuracy_m = geo_accuracy_m
+        
+        self.device_profile = device_profile
+        self.device = device
+        self.persist_cookie_file = persist_cookie_file
+        # ✅ Initialize CAPTCHA state
         self._captcha_prompted = False
-        self._p = None
-        self._browser = None
-        self._ctx = None
-        self.page = None
 
     def __enter__(self):
         from playwright.sync_api import sync_playwright
         self._p = sync_playwright().start()
+
         browser_args = {"headless": self.headless}
         if self.proxy:
             browser_args["proxy"] = {"server": self.proxy}
-        self._browser = self._p.chromium.launch(**browser_args)
 
-        ctx_args = {}
+        if self.browser == "chromium":
+            self._browser = self._p.chromium.launch(**browser_args)
+        elif self.browser == "firefox":
+            self._browser = self._p.firefox.launch(**browser_args)
+        elif self.browser == "webkit":
+            self._browser = self._p.webkit.launch(**browser_args)
+        else:
+            raise ValueError(f"Unsupported browser: {self.browser}")
+
+
+        # --- CONTEXT options ---
+        ctx_args = {
+            "permissions": ["geolocation"],   # allow GPS
+        }
+
+        # If user selected a real device profile
+        if self.device:
+            devices = self._p.devices
+            if self.device in devices:
+                print(f"📱 Using device profile: {self.device}")
+                ctx_args.update(devices[self.device])
+            else:
+                print(f"⚠️ Unknown device '{self.device}'. Available examples:")
+                for d in list(self._p.devices.keys())[:10]:
+                    print("   -", d)
+                raise ValueError(f"Device '{self.device}' not found in Playwright presets.")
+
+        # --- Device profile tweaks (desktop vs mobile) ---
+        if self.device_profile == "mobile":
+            # Tell Playwright "I'm a phone" (simplified)
+            ctx_args.update({
+                    "is_mobile": True,
+                    "has_touch": True,
+                    "viewport": {"width": 390, "height": 844},  # ~iPhone-ish
+                    "device_scale_factor": 3,
+                }
+            )
+        # you can add more profiles later (android, tablet, etc.)
+
         if self.user_agent:
             ctx_args["user_agent"] = self.user_agent
+
+        # Add geolocation if provided
+        if self.latitude is not None and self.longitude is not None:
+            ctx_args["geolocation"] = {
+                "latitude": float(self.latitude),
+                "longitude": float(self.longitude),
+                "accuracy": float(self.geo_accuracy_m),
+            }
+            ctx_args["timezone_id"] = "UTC"   # Optional but helps TikTok geo-behavior
+            ctx_args["locale"] = "en-US"      # Optional
+
         self._ctx = self._browser.new_context(**ctx_args)
+
+        # ---------------------------------------------------------
+        # Load cookies from previous run, if the file exists
+        # ---------------------------------------------------------
+        cookie_file = getattr(self, "persist_cookie_file", None)
+        if cookie_file and os.path.exists(cookie_file):
+            try:
+                with open(cookie_file, "r", encoding="utf-8") as f:
+                    cookies = json.load(f)
+                # Only keep TikTok cookies
+                cookies = [c for c in cookies if "tiktok.com" in c.get("domain", "")]
+                if cookies:
+                    self._ctx.add_cookies(cookies)
+                    print(f"🍪 Loaded {len(cookies)} stored cookies from {cookie_file}")
+            except Exception as e:
+                print(f"⚠️ Could not load cookies: {e}")
+
 
         if self.ms_token:
             self._ctx.add_cookies([{
@@ -905,7 +1121,18 @@ class TikTokScraperSession:
         self.page = self._ctx.new_page()
         return self
 
+
     def __exit__(self, exc_type, exc, tb):
+        # Save cookies before shutting down
+        try:
+            cookie_file = getattr(self, "persist_cookie_file", None)
+            if cookie_file and self._ctx:
+                cookies = self._ctx.cookies()
+                with open(cookie_file, "w", encoding="utf-8") as f:
+                    json.dump(cookies, f, indent=2, ensure_ascii=False)
+                print(f"💾 Saved {len(cookies)} TikTok cookies → {cookie_file}")
+        except Exception as e:
+            print(f"⚠️ Could not save cookies: {e}")
         try:
             if self._browser:
                 self._browser.close()
@@ -1578,6 +1805,62 @@ def add_common_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--flat", action="store_true",
                    default=True,
                    help="Save all videos in a single flat directory (no subfolders)")
+    p.add_argument("--lat", type=float,
+                   help="Latitude for GPS spoofing (overrides --city/--country if set)")
+    p.add_argument("--lon", type=float,
+                   help="Longitude for GPS spoofing (overrides --city/--country if set)")
+
+    p.add_argument("--city",
+                   help="City name used to infer GPS location (e.g., 'Toronto')")
+    p.add_argument("--state", "--province",
+                   dest="state",    help="State or province name" )
+    p.add_argument("--country",
+                   help="ISO country code used with --city (e.g., 'CA', 'JP')")
+    p.add_argument(
+        "--device-profile",
+        choices=["desktop", "mobile"],
+        default="desktop",
+        help="Device profile for Playwright (desktop or mobile).",
+    )
+    p.add_argument(
+        "--geo-uncertainty-m",
+        type=float,
+        default=0.0,
+        help="Random jitter radius (in meters) to add to spoofed GPS coordinates.",
+    )
+
+    p.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        help="Specific mobile device profile (e.g. 'iPhone 13', 'Pixel 7', 'Galaxy S22').",
+    )
+
+    p.add_argument(
+        "--persist-playwright-cookies",
+        default="pw_cookies.json",
+        help="Path to store and load Playwright browser cookies."
+    )
+
+    p.add_argument(
+        "--geo-accuracy-m",
+        type=float,
+        default=10.0,
+        help="GPS accuracy in meters (Playwright geolocation 'accuracy' field). Default = 30",
+    )
+
+    p.add_argument(
+        "--browser",
+        choices=["chromium", "firefox", "webkit"],
+        default="chromium",
+        help="Choose Playwright browser engine."
+    )
+
+
+
+
+
+
 
 
 def scrape_with_recovery(
@@ -1744,6 +2027,13 @@ def scrape_with_recovery(
         return []
     return urls
 
+def cmd_list_devices(args):
+    from playwright.sync_api import sync_playwright
+    with sync_playwright() as p:
+        print("Available Playwright device presets:\n")
+        for name in sorted(p.devices.keys()):
+            print(" -", name)
+
 
 
 def cmd_scrape(args: argparse.Namespace) -> None:
@@ -1771,6 +2061,11 @@ def cmd_scrape(args: argparse.Namespace) -> None:
 
     setup_logging(args.log_level, None if str(args.log_file).strip() == "" else args.log_file)
     count = parse_count(args.count) if args.count is not None else None
+
+    # Derive lat/lon from --city/--country if explicit values not given
+    ensure_lat_lon_from_args(args)
+
+
     ids = read_identifiers(args)  # list[(identifier, id_type)]
     scrape_ip = get_public_ip()
 
@@ -1830,6 +2125,13 @@ def cmd_scrape(args: argparse.Namespace) -> None:
         user_agent=args.user_agent,
         ms_token=args.ms_token,
         pause_for_captcha=not args.no_captcha_pause,
+        latitude=args.lat,
+        longitude=args.lon,
+        geo_accuracy_m=args.geo_accuracy_m, 
+        device_profile=args.device_profile,
+        device=args.device, 
+        browser=args.browser,
+        persist_cookie_file=args.persist_playwright_cookies
     ) as sess:
         with tqdm(total=len(to_process), desc="Processing remaining identifiers", unit="id") as overall:
             for x in to_process:
@@ -1862,6 +2164,7 @@ def cmd_scrape(args: argparse.Namespace) -> None:
 
 
 
+
                 save_urls_to_csv(
                     urls=urls,
                     filename=links_csv,
@@ -1869,8 +2172,9 @@ def cmd_scrape(args: argparse.Namespace) -> None:
                     query=identifier,
                     scraped_at=scraped_at,
                     ip_address=scrape_ip,
+                    latitude=args.lat,
+                    longitude=args.lon,
                 )
-
 
 
                 write_links_to_sqlite(
@@ -1880,7 +2184,10 @@ def cmd_scrape(args: argparse.Namespace) -> None:
                     query=identifier,
                     scraped_at=scraped_at,
                     ip_address=scrape_ip,
+                    latitude=args.lat,
+                    longitude=args.lon,
                 )
+
 
 
                 n = len(urls)
@@ -1952,6 +2259,10 @@ def cmd_all(args: argparse.Namespace) -> None:
     setup_logging(args.log_level, None if str(args.log_file).strip() == "" else args.log_file)
 
     count = parse_count(args.count) if args.count is not None else None
+
+    ensure_lat_lon_from_args(args)
+
+
     scrape_ip = get_public_ip()
     ids = read_identifiers(args)
 
@@ -1991,6 +2302,11 @@ def cmd_all(args: argparse.Namespace) -> None:
         user_agent=args.user_agent,
         ms_token=args.ms_token,
         pause_for_captcha=not args.no_captcha_pause,
+        latitude=args.lat,
+        longitude=args.lon,
+        device_profile=args.device_profile,
+        geo_accuracy_m=args.geo_accuracy_m,
+        browser=args.browser,
     ) as sess:
         for identifier, id_type in ids:
             safe_id = sanitize_id_for_path(identifier, id_type)
@@ -2053,6 +2369,8 @@ def cmd_all(args: argparse.Namespace) -> None:
                 query=identifier,
                 scraped_at=scraped_at,
                 ip_address=scrape_ip,
+                latitude=args.lat,
+                longitude=args.lon,
             )
 
             write_links_to_sqlite(
@@ -2062,7 +2380,10 @@ def cmd_all(args: argparse.Namespace) -> None:
                 query=identifier,
                 scraped_at=scraped_at,
                 ip_address=scrape_ip,
+                latitude=args.lat,
+                longitude=args.lon,
             )
+
 
 
 
@@ -2205,8 +2526,18 @@ def build_parser() -> argparse.ArgumentParser:
     add_common_args(p_all)
     p_all.set_defaults(func=cmd_all)
 
-    p.add_argument("--version", action="version", version="TikTok Collector 1.5.0")
+    # --- Utility: list Playwright device profiles ---
+    p_dev = sub.add_parser(
+        "list-devices",
+        help="Show all available Playwright device profiles for use with --device.",
+        formatter_class=SmartFormatter,
+    )
+    p_dev.set_defaults(func=cmd_list_devices)
+
+    p.add_argument("--version", action="version", version="TikTok Collector 2.0.0")
+
     return p
+
 
 
 def main(argv: Optional[List[str]] = None) -> None:
