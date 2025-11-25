@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+
+#__author__ = 'Qasem Exirifard (qasem.exirifard@international.gc.ca)'
 """
 TikTok Collector — batch-friendly CLI with single-session scraping
 (scrape → metadata → optional download)
@@ -50,7 +52,23 @@ from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 import os
 from datetime import datetime, timezone
+import hashlib
 
+import math
+import random
+import time
+
+from geopy.geocoders import Nominatim
+
+import re
+from urllib.parse import urlparse, parse_qs, unquote
+
+from pathlib import Path
+
+# ➡️ Your Playwright Imports
+from playwright.sync_api import sync_playwright
+# 🚀 CORRECT LOCATION FOR STEALTH IMPORT
+from playwright_stealth.stealth import Stealth
 
 
 class MetadataLockActive(Exception):
@@ -118,7 +136,33 @@ ENV_PROXY        = os.getenv("PROXY")
 ENV_COOKIES_FILE = os.getenv("COOKIES_FILE")
 ENV_USER_AGENT   = os.getenv("USER_AGENT", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
 
-from pathlib import Path
+COUNTRY_TO_LOCALE = {
+    "CA": "en-CA",
+    "US": "en-US",
+    "GB": "en-GB",
+    "FR": "fr-FR",
+    "DE": "de-DE",
+    "IR": "fa-IR",
+    "JP": "ja-JP",
+    "CN": "zh-CN",
+    "IN": "en-IN",
+    "AU": "en-AU",
+    "BR": "pt-BR",
+}
+
+def guess_locale_from_country(country: str) -> str:
+    if not country:
+        return "en-US"
+    c = country.strip().upper()
+    return COUNTRY_TO_LOCALE.get(c, "en-US")
+
+# In tiktok_tool.py, near the top where other imports are:
+from datetime import datetime, timezone
+
+# Add this line if external code/cache files are improperly referencing UTC
+#UTC = timezone.utc
+
+
 
 # Base directory for SQLite files
 SQLITE_DIR = Path("sqlite_dbs")
@@ -147,6 +191,13 @@ console.setFormatter(formatter)
 
 logger.addHandler(console)
 
+# ─────────────────────────────── Validators/Regex ────────────────────────────
+IDENTIFIER_RE =  re.compile(r"^[\w._-]+$", re.UNICODE) #re.compile(r"^[A-Za-z0-9._]+$")
+
+#VIDEO_URL_RE  = re.compile(r"^https?://www\.tiktok\.com/@[^/]+/video/\d+/?(?:\?.*)?$")
+VIDEO_URL_RE  = re.compile(
+    r"^https?://www\.tiktok\.com/@[^/]+/(?:video|photo)/\d+/?(?:\?.*)?$"
+)
 
 
 def setup_logging(level: str = "INFO", log_file: Optional[str] = DEFAULT_LOG_FILE) -> None:
@@ -176,13 +227,8 @@ def get_public_ip(timeout: int = 5) -> str:
 
 
 
-# ─────────────────────────────── Validators/Regex ────────────────────────────
-IDENTIFIER_RE =  re.compile(r"^[\w._-]+$", re.UNICODE) #re.compile(r"^[A-Za-z0-9._]+$")
+# ─────────────────
 
-# old
-#VIDEO_URL_RE  = re.compile(r"^https?://www\.tiktok\.com/@[^/]+/video/\d+/?$")
-# new
-VIDEO_URL_RE  = re.compile(r"^https?://www\.tiktok\.com/@[^/]+/video/\d+/?(?:\?.*)?$")
 
 
 def parse_identifier(raw: str) -> Tuple[str, str]:
@@ -205,12 +251,12 @@ def parse_identifier(raw: str) -> Tuple[str, str]:
 
 
 
-import hashlib
+
 
 def sanitize_id_for_path(identifier: str, id_type: str | None = None) -> str:
     base = re.sub(r"[^\w._-]+", "_", identifier, flags=re.UNICODE)
-    if id_type == "keyword":
-        # Add a short hash that *does* distinguish case
+    # All keyword-based searches must have hashed filenames
+    if id_type in ("keyword", "keyword-video", "keyword-photo"):
         h = hashlib.sha1(identifier.encode("utf-8")).hexdigest()[:6]
         return f"{base}__{h}"
     return base
@@ -230,10 +276,70 @@ def parse_count(maybe: Optional[str]) -> Optional[int]:
 
 # ───────────────────────────── I/O helpers & templates ───────────────────────
 
+def collect_extra_identifiers(args):
+    """
+    Convert --hashtag, --usernames, --search, --search-video, --search-photo
+    into the same (identifier, id_type) tuples used everywhere else.
+    """
+    out = []
+
+    # --- Hashtags ---
+    if args.hashtag:
+        for h in args.hashtag:
+            out.append((h, "hashtag"))
+
+    # --- Users ---
+    if args.usernames:
+        for u in args.usernames:
+            out.append((u, "user"))
+
+    # --- Keyword search ---
+    if args.search:
+        for kw in args.search:
+            out.append((kw, "keyword"))
+
+    # --- Video search only ---
+    if args.search_video:
+        for kw in args.search_video:
+            out.append((kw, "keyword-video"))
+
+    # --- Photo search only ---
+    if args.search_photo:
+        for kw in args.search_photo:
+            out.append((kw, "keyword-photo"))
+
+    return out
 
 
-import math
-import random
+def read_identifiers(args):
+    parsed = []
+
+    # 1. Existing identifier logic (#, @, {keyword})
+    if getattr(args, "identifiers", None):
+        for raw in args.identifiers:
+            identifier, id_type = parse_identifier(raw)
+            parsed.append((identifier, id_type))
+
+    # 2. Append new enhanced identifiers
+    parsed.extend(collect_extra_identifiers(args))
+
+    # 3. From file
+    if getattr(args, "id_file", None):
+        with open(args.id_file, "r", encoding="utf-8") as f:
+            for line in f:
+                s = line.strip()
+                if not s or s.startswith("#"):
+                    continue
+                identifier, id_type = parse_identifier(s)
+                parsed.append((identifier, id_type))
+
+    if not parsed:
+        raise SystemExit("No identifiers provided.")
+
+    return parsed
+
+
+# --- geo function
 
 def jitter_coordinates(
     lat: float | None,
@@ -276,7 +382,7 @@ def jitter_coordinates(
 
     return lat2, lon2
 
-from geopy.geocoders import Nominatim
+
 
 def geocode_city(city: str, state: str=None, country: str=None)-> tuple[float | None, float | None]:
     """
@@ -352,8 +458,7 @@ def ensure_lat_lon_from_args(args: argparse.Namespace) -> None:
     args.lon = lon
 
 
-import re
-from urllib.parse import urlparse, parse_qs, unquote
+
 
 def extract_tiktok_video_id(url: str) -> str | None:
     """
@@ -450,7 +555,7 @@ def resolve_filename(template: str, identifier_stem: str, default_template: str)
 
 
 
-
+#-- IO
 
 def save_urls_to_csv(
     urls: Iterable[str],
@@ -780,6 +885,12 @@ def save_metadata_to_csv(
 
 
 
+SQLITE_METADATA_COLUMNS = [
+    "id", "title", "uploader", "artist", "uploader_id", 
+    "upload_date", "view_count", "like_count", "repost_count",
+    "comment_count", "description", "tags", "webpage_url", "scraped_at"
+]
+
 def write_metadata_to_sqlite(
     db_path: str | Path,
     records: list[dict[str, Any]],
@@ -799,6 +910,8 @@ def write_metadata_to_sqlite(
       view_count, like_count, repost_count, comment_count,
       description, tags, webpage_url, scraped_at (if missing, filled with now-UTC)
     """
+
+
     if not records:
         return
 
@@ -945,50 +1058,6 @@ def write_metadata_to_sqlite(
             print(f"❌ Metadata: failed to write into SQLite → {db_path}")
 
 
-def read_identifiers(args: argparse.Namespace) -> List[Tuple[str, str]]:
-    """
-    Collect identifiers from CLI arguments, optional ID file, and --search keywords.
-    Returns a list of tuples: (identifier, id_type)
-      id_type ∈ {"hashtag", "user", "keyword"}
-    """
-    raws: List[str] = []
-
-    # 1) Keyword search phrases from --search
-    if getattr(args, "search", None):
-        for kw in args.search:
-            kw = kw.strip()
-            if kw:
-                # Wrap in {} to reuse keyword-handling logic
-                raws.append(f"{{{kw}}}")
-
-    # 2) Direct identifiers from positional args (#hashtags/@users/{keywords})
-    if getattr(args, "identifiers", None):
-        raws.extend(args.identifiers)
-
-    # 3) Identifiers read from a file (--id-file)
-    if getattr(args, "id_file", None):
-        with open(args.id_file, "r", encoding="utf-8") as f:
-            for line in f:
-                s = line.strip()
-                # Allow comment lines starting with "# "
-                if s and not s.startswith("# "):
-                    raws.append(s)
-
-    # 4) Ensure we have something
-    if not raws:
-        raise SystemExit(
-            "No identifiers provided. Use #hashtags, @users, {keywords}, "
-            "or --search 'keyword phrases'."
-        )
-
-    # 5) Parse and validate identifiers
-    parsed: List[Tuple[str, str]] = []
-    for r in raws:
-        identifier, id_type = parse_identifier(r)
-        parsed.append((identifier, id_type))
-
-    return parsed
-
 
 
 # ─────────────────────────── Reusable Playwright Session ─────────────────────
@@ -1012,6 +1081,8 @@ class TikTokScraperSession:
         device: Optional[str] = None,
         browser:  Optional[str] ="chromium",
         persist_cookie_file: Optional[str] = None,
+        country: Optional[str] = None,
+        locale: Optional[str] = None,
     ):
         self.headless = headless
         self.proxy = proxy
@@ -1030,23 +1101,53 @@ class TikTokScraperSession:
         self.persist_cookie_file = persist_cookie_file
         # ✅ Initialize CAPTCHA state
         self._captcha_prompted = False
+        self._stealth = None
+        self.country = country 
+        self.locale = locale
+
 
     def __enter__(self):
-        from playwright.sync_api import sync_playwright
+
+
         self._p = sync_playwright().start()
 
         browser_args = {"headless": self.headless}
+
+        # Add Chrome stealth flag
+        # Add Chrome stealth flags (safe subset)
+        chrome_extra_args = [
+            # Core anti-automation
+            "--disable-blink-features=AutomationControlled",
+            "--disable-infobars",
+
+            # Stability / resource flags
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+
+            # Optional: quiet logging
+            "--disable-logging",
+            "--log-level=3",
+        ]
+
+
+
         if self.proxy:
             browser_args["proxy"] = {"server": self.proxy}
 
         if self.browser == "chromium":
+            # Add extra args here
+            browser_args["args"] = chrome_extra_args
             self._browser = self._p.chromium.launch(**browser_args)
+
         elif self.browser == "firefox":
             self._browser = self._p.firefox.launch(**browser_args)
+
         elif self.browser == "webkit":
             self._browser = self._p.webkit.launch(**browser_args)
+
         else:
             raise ValueError(f"Unsupported browser: {self.browser}")
+
 
 
         # --- CONTEXT options ---
@@ -1091,6 +1192,19 @@ class TikTokScraperSession:
             ctx_args["timezone_id"] = "UTC"   # Optional but helps TikTok geo-behavior
             ctx_args["locale"] = "en-US"      # Optional
 
+        # --- Locale (browser language) ---
+        if self.locale:
+            chosen_locale = self.locale
+        elif self.country:
+            chosen_locale = guess_locale_from_country(self.country)
+        else:
+            chosen_locale = "en-US"
+
+        ctx_args["locale"] = chosen_locale
+        ctx_args.setdefault("extra_http_headers", {})
+        ctx_args["extra_http_headers"]["Accept-Language"] = f"{chosen_locale},en;q=0.8"
+        print(f"🌐 Browser locale set to {chosen_locale}")
+
         self._ctx = self._browser.new_context(**ctx_args)
 
         # ---------------------------------------------------------
@@ -1119,8 +1233,87 @@ class TikTokScraperSession:
             }])
 
         self.page = self._ctx.new_page()
+        # ⭐ Apply stealth using the Stealth class (sync API)
+        self._stealth = Stealth()
+        self._stealth.apply_stealth_sync(self.page)
+        print("👻 Playwright stealth evasions applied to main page.")
+
         return self
 
+    def _dismiss_login_modal(self):
+        # TODO: if you want, you can programmatically close the small login
+        # modal that sometimes appears over search results.
+        # For now this is a no-op.
+        pass 
+
+    def login_interactive(self, login_url: str = "https://www.tiktok.com/login"):
+        """
+        Open TikTok's login page so the user can authenticate manually.
+
+        Any resulting cookies will be saved to self.persist_cookie_file when
+        the context manager exits (__exit__).
+        """
+        print(f"🌐 Opening TikTok login page → {login_url}")
+        try:
+            self.page.goto(login_url, wait_until="networkidle")
+        except PlaywrightTimeoutError:
+            # Sometimes TikTok is slow; as long as the window is up, user can log in.
+            print(
+                "⚠️ Login page did not fully finish loading before timeout, "
+                "but the browser window is open. You can still try to log in there."
+            )
+
+        print(
+            "\nNow use the Playwright browser window to log in to TikTok.\n"
+            "You can use any of TikTok's normal login methods (QR code, email, etc.).\n"
+            "When you see that you're logged in (your profile/feed visible),\n"
+            "come back to this terminal.\n"
+        )
+        input("✅ Press ENTER here when login is complete so cookies can be saved… ")
+ 
+
+
+    def create_stealth_page(self, context_args: dict = None):
+        # 1. Create a new context (highly recommended for better isolation)
+        if context_args is None:
+            context_args = {}
+            
+        # Example: If you need to set cookies or a user agent for the context
+        context = self._browser.new_context(**context_args) 
+        
+        # 2. Create the page object
+        page = context.new_page()
+
+        # Reuse Stealth instance if we already created one, otherwise create it
+        if getattr(self, "_stealth", None) is None:
+            self._stealth = Stealth()
+
+
+        self._stealth.apply_stealth_sync(page)
+
+        return page
+
+    def human_scroll(self):
+        """
+        Perform human-like scrolling behavior:
+        - random scroll distances
+        - small jitter scrolls
+        - random wait times between scrolls
+        """
+        page = self.page
+
+        # Main scroll (randomized heavy scroll)
+        distance = random.randint(800, 1800)
+        page.evaluate(f"window.scrollBy(0, {distance});")
+
+        # Random pause, simulating reading
+        time.sleep(random.uniform(0.6, 2.2))
+
+        # Optional micro-scrolls (jitter)
+        for _ in range(random.randint(1, 3)):
+            jitter = random.randint(-80, 180)
+            page.evaluate(f"window.scrollBy(0, {jitter});")
+            time.sleep(random.uniform(0.2, 0.8))
 
     def __exit__(self, exc_type, exc, tb):
         # Save cookies before shutting down
@@ -1190,6 +1383,12 @@ class TikTokScraperSession:
             start_url = f"https://www.tiktok.com/@{encoded}"
         elif id_type == "keyword":
             start_url = f"https://www.tiktok.com/search?q={encoded}"
+        elif id_type == "keyword-video":
+            start_url = f"https://www.tiktok.com/search/video?q={encoded}"
+
+        elif id_type == "keyword-photo":
+            start_url = f"https://www.tiktok.com/search/photo?q={encoded}"
+
         else:
             raise ValueError(f"Unsupported id_type: {id_type}")
 
@@ -1212,6 +1411,7 @@ class TikTokScraperSession:
             return []
 
         self.page.wait_for_timeout(3000)
+        self._dismiss_login_modal()
 
         # ───────────────────────────────────────────────────────────
         # Detect “Couldn't find this hashtag/user” BEFORE CAPTCHA
@@ -1236,18 +1436,28 @@ class TikTokScraperSession:
             pbar.close()
             return "__HASHTAG_NOT_FOUND__"
 
-        # No “not found” → check normal CAPTCHA flow
+        # --- CAPTCHA handling ---
         self._maybe_prompt_captcha_once()
 
-        # No “not found” → check normal CAPTCHA flow
-        self._maybe_prompt_captcha_once()
+        # After solving CAPTCHA, TikTok often redirects to plain /search?q=
+        # If we requested photo/video search, force re-navigation back
+        current_url = self.page.url
+        #print(current_url)
+        if id_type in ("keyword-photo", "keyword-video"):
+            if "/search?" in current_url and "/search/photo?" not in current_url and "/search/video?" not in current_url:
+                print("↩️ TikTok redirected to generic search. Restoring the intended mode…")
+                self.page.goto(start_url, timeout=timeout_ms)
+                self.page.wait_for_timeout(2500)
+                self._dismiss_login_modal()
+
 
 
 
         idle_loops = 0
         while count is None or len(urls) < count:
+            self._dismiss_login_modal() # ensure login popup hasn't reappeared
             prev = len(urls)
-            self.page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            self.human_scroll()
             self.page.wait_for_timeout(1500)
             for a in self.page.query_selector_all('a[href*="/video/"]'):
                 href = a.get_attribute("href") or ""
@@ -1258,10 +1468,14 @@ class TikTokScraperSession:
                     pbar.update(1)
                     if count and len(urls) >= count:
                         break
+            if random.random() < 0.15:   # 15% chance
+                self.page.evaluate("window.scrollBy(0, -300);")
+                time.sleep(random.uniform(0.3, 1.0))
             if len(urls) == prev:
-                idle_loops += 1
+                idle_loops += random.choice([0, 1])  # sometimes treat it as non-idle
             else:
                 idle_loops = 0
+
             if idle_loops >= max_scroll_idle:
                 break
 
@@ -1271,15 +1485,6 @@ class TikTokScraperSession:
 
 # ───────────────────────────── Metadata & Download ───────────────────────────
 
-import json
-from datetime import datetime, UTC
-
-from datetime import datetime, UTC
-from urllib.parse import quote  # already imported earlier
-from pathlib import Path
-import json
-from typing import Optional
-from yt_dlp import YoutubeDL
 
 
 def fetch_tiktok_metadata(url: str, cookies_file: Optional[str], user_agent: str,  max_age_hours: float = 12, verbose = False) -> dict:
@@ -1338,11 +1543,11 @@ def fetch_tiktok_metadata(url: str, cookies_file: Optional[str], user_agent: str
                     try:
                         dt = datetime.fromisoformat(entry_scraped_at.replace("Z", "+00:00"))
                         if dt.tzinfo is None:
-                            dt = dt.replace(tzinfo=UTC)
+                            dt = dt.replace(tzinfo=timezone.utc)
                     except Exception:
                         continue
 
-                    age_hours = (datetime.now(UTC) - dt).total_seconds() / 3600.0
+                    age_hours = (datetime.now(timezone.utc) - dt).total_seconds() / 3600.0
                     if age_hours < max_age_hours:
                         # Candidate: fresh enough
                         if freshest_dt is None or dt > freshest_dt:
@@ -1353,10 +1558,11 @@ def fetch_tiktok_metadata(url: str, cookies_file: Optional[str], user_agent: str
                     info, scraped_at = freshest_entry
                     use_cache = True
                 else:
-                    logger.info(
-                        "All cache entries in %s are older than %s hours → re-fetching.",
-                        cache_path, max_age_hours
-                    )
+                    if verbose:
+                        logger.info(
+                            "All cache entries in %s are older than %s hours → re-fetching.",
+                            cache_path, max_age_hours
+                        )
 
             # ─────────────────────────────────────────────
             # OLD STYLE: single dict
@@ -1376,8 +1582,8 @@ def fetch_tiktok_metadata(url: str, cookies_file: Optional[str], user_agent: str
                 try:
                     dt = datetime.fromisoformat(scraped_at.replace("Z", "+00:00"))
                     if dt.tzinfo is None:
-                        dt = dt.replace(tzinfo=UTC)
-                    age_hours = (datetime.now(UTC) - dt).total_seconds() / 3600.0
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    age_hours = (datetime.now(timezone.utc) - dt).total_seconds() / 3600.0
                     if age_hours < max_age_hours:
                         use_cache = True
                     else:
@@ -1431,7 +1637,7 @@ def fetch_tiktok_metadata(url: str, cookies_file: Optional[str], user_agent: str
         if cookies_file:
             opts["cookiefile"] = cookies_file
 
-        scraped_at = datetime.now(UTC).isoformat()
+        scraped_at = datetime.now(timezone.utc).isoformat()
 
         with YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
@@ -1501,59 +1707,79 @@ def fetch_tiktok_metadata(url: str, cookies_file: Optional[str], user_agent: str
 
 
 
-def batch_fetch_metadata(urls: Iterable[str], out_csv: str | Path,
-                         cookies_file: Optional[str], user_agent: str,
-                         db_path: str = SQLIGHT_METADATA, consecutive_errors_before_deciding_being_blocked=4, verbose= False) -> str:
-    out_csv = str(out_csv)
-    results = []
-
-    # One timestamp for this metadata batch
-    scraped_at = datetime.now(timezone.utc).isoformat()
-
-    pbar = tqdm(list(urls), desc=f"Metadata → {Path(out_csv).name}", unit="vid")
-
-
-    consecutive_block_errors = 0  # outside the loop, before `for url in pbar`
-
-
+def batch_fetch_metadata(
+        urls: Iterable[str], 
+        out_csv: str | Path,
+        cookies_file: Optional[str], 
+        user_agent: str,
+        db_path: str = SQLIGHT_METADATA, 
+        consecutive_errors_before_deciding_being_blocked=4, 
+        verbose= False
+    ) -> str:
     
-    for url in pbar:
-        while True:
+    # ... setup code ...
+    urls_list = list(urls) # Must convert Iterable to a List to iterate
+    results = []
+    scraped_at = datetime.now(timezone.utc).isoformat()
+    # Use METADATA_WORKERS, which is defined globally
+    pbar = tqdm(urls_list, desc=f"Metadata → {Path(out_csv).name}", unit="vid")
+
+
+# 1. Start workers
+    with ThreadPoolExecutor(max_workers=METADATA_WORKERS) as executor:
+        # Submit all fetch jobs
+        futures = {
+            executor.submit(
+                fetch_tiktok_metadata,
+                url,
+                cookies_file,
+                user_agent,
+                verbose=verbose,
+            ): url
+            for url in urls_list
+        }
+        
+        consecutive_block_errors = 0
+        
+        # 2. Process results as they complete
+        for future in as_completed(futures):
+            url = futures[future]
+            pbar.update(1)
+            
             try:
-                info = fetch_tiktok_metadata(url, cookies_file, user_agent)
-                # attach batch-level scraped_at
-                info["scraped_at"] = scraped_at
-                results.append(info)
+                # Get the result from the worker thread
+                res = future.result()
+                if res and not res.get("_from_cache", False):
+                    # Only fresh results count for blocking logic
+                    consecutive_block_errors = 0
+                
+                if res:
+                    results.append(res)
 
-                # success → reset streak and go to next URL
-                consecutive_block_errors = 0
-                break
-
-            except MetadataLockActive as e:
-                # Another process is already fetching this URL's metadata.
-                # Do NOT hit TikTok; just skip this URL in this run.
-                logger.info("Skipping metadata for %s due to active lock: %s", url, e)
-                consecutive_block_errors = 0
-                break
-
+            except MetadataLockActive:
+                # Already handled by fetch_tiktok_metadata, just log/continue
+                logger.debug("Skipping due to active lock: %s", url)
+                
             except Exception as e:
-                if verbose:
-                    logger.error("Metadata error for %s: %s", url, e)
-
+                # Handle blocking errors (yt-dlp errors, etc.)
                 if _is_tiktok_block_error(e):
                     consecutive_block_errors += 1
-
+                    logger.error(
+                        "Metadata block error (%d/%d) for %s: %s",
+                        consecutive_block_errors,
+                        consecutive_errors_before_deciding_being_blocked,
+                        url,
+                        e,
+                    )
+                    
                     if consecutive_block_errors >= consecutive_errors_before_deciding_being_blocked:
                         _prompt_for_ip_change()
+                        # After user hits Enter, reset counter and continue trying
                         consecutive_block_errors = 0
-
-                    # retry same URL after (possibly) changing IP
-                    continue
                 else:
-                    # non-block error → reset streak and give up on this URL
-                    consecutive_block_errors = 0
-                    break
-    Path(out_csv).parent.mkdir(parents=True, exist_ok=True)
+                    logger.error("Unknown error fetching metadata for %s: %s", url, e)
+
+    pbar.close()
 
 
 
@@ -1794,8 +2020,6 @@ def add_common_args(p: argparse.ArgumentParser) -> None:
                    choices=["DEBUG","INFO","WARNING","ERROR"], help="Log level")
     p.add_argument("--log-file", default=DEFAULT_LOG_FILE,
                    help="Log file (blank to disable)")
-    p.add_argument("--search", nargs="+",
-                    help="Search TikTok by keyword(s) instead of #/@ identifiers (e.g., --search 'quantum computing' 'AI ethics')")
     p.add_argument("--downloads-dir", default="downloads",
                    help="Directory to store all downloaded videos (flat)")
     p.add_argument("--links-dir", default="links",
@@ -1856,11 +2080,26 @@ def add_common_args(p: argparse.ArgumentParser) -> None:
         help="Choose Playwright browser engine."
     )
 
+    p.add_argument("--hashtag", nargs="+",
+               help="List of hashtags (without #). Example: --hashtag Canada Ottawa")
 
+    p.add_argument("--usernames", nargs="+",
+                help="List of usernames (without @). Example: --usernames nasa g7")
 
+    p.add_argument("--search", nargs="+",
+                help="Keyword search (general). Example: --search Canada 'quantum computing'")
 
+    p.add_argument("--search-video", nargs="+",
+                help="Keyword search, but restrict to videos only")
 
-
+    p.add_argument("--search-photo", nargs="+",
+                help="Keyword search, but restrict to photos only")
+    
+    p.add_argument(
+        "--locale",
+        default=None,
+        help="Browser locale (default auto by country: CA → en-CA, FR → fr-FR, etc.)"
+    )
 
 
 def scrape_with_recovery(
@@ -2035,6 +2274,41 @@ def cmd_list_devices(args):
             print(" -", name)
 
 
+def cmd_login(args: argparse.Namespace) -> None:
+    """
+    Open a Playwright browser so the user can log in to TikTok once.
+    Cookies are saved to --persist-playwright-cookies and reused later.
+    """
+    # normal logging setup
+    setup_logging(
+        args.log_level,
+        None if str(args.log_file).strip() == "" else args.log_file,
+    )
+
+    # Optional: derive lat/lon from --city/--country so login already uses spoofed GPS
+    ensure_lat_lon_from_args(args)
+
+    auto_locale = args.locale or guess_locale_from_country(getattr(args, "country", None))
+
+    with TikTokScraperSession(
+        headless=args.headless,
+        proxy=args.proxy,
+        user_agent=args.user_agent,
+        ms_token=args.ms_token,
+        pause_for_captcha=not args.no_captcha_pause,
+        latitude=getattr(args, "lat", None),
+        longitude=getattr(args, "lon", None),
+        geo_accuracy_m=args.geo_accuracy_m,
+        device_profile=args.device_profile,
+        device=args.device,
+        browser=args.browser,
+        persist_cookie_file=args.persist_playwright_cookies,
+        country=getattr(args, "country", None),
+        locale=auto_locale,
+    ) as sess:
+        sess.login_interactive()
+        # When we exit the with-block, __exit__ saves cookies to persist_cookie_file
+
 
 def cmd_scrape(args: argparse.Namespace) -> None:
     """
@@ -2118,6 +2392,7 @@ def cmd_scrape(args: argparse.Namespace) -> None:
             print(f"{id_disp}  {rows_disp}  {x['csv']}")
         print("================================================================\n")
 
+    auto_locale = args.locale or guess_locale_from_country(args.country)
     # ---------- Scrape the remaining with a single overall tqdm ----------
     with TikTokScraperSession(
         headless=args.headless,
@@ -2131,7 +2406,9 @@ def cmd_scrape(args: argparse.Namespace) -> None:
         device_profile=args.device_profile,
         device=args.device, 
         browser=args.browser,
-        persist_cookie_file=args.persist_playwright_cookies
+        persist_cookie_file=args.persist_playwright_cookies,
+        country=args.country,
+        locale=auto_locale,
     ) as sess:
         with tqdm(total=len(to_process), desc="Processing remaining identifiers", unit="id") as overall:
             for x in to_process:
@@ -2197,8 +2474,6 @@ def cmd_scrape(args: argparse.Namespace) -> None:
                     logger.warning("❗ %s → %d URLs (< %d).", identifier, n, MIN_OK_URLS)
 
                 overall.update(1)
-
-
 
 
 def cmd_metadata(args: argparse.Namespace) -> None:
@@ -2295,6 +2570,9 @@ def cmd_all(args: argparse.Namespace) -> None:
     # We'll keep all URLs in memory, keyed by safe identifier
     urls_by_id: dict[str, list[str]] = {}
 
+    locale = args.locale or guess_locale_from_country(args.country)
+
+    auto_locale = args.locale or guess_locale_from_country(args.country)
     # ───────────────────── Phase 1: SCRAPE ────────────────────────
     with TikTokScraperSession(
         headless=args.headless,
@@ -2305,8 +2583,11 @@ def cmd_all(args: argparse.Namespace) -> None:
         latitude=args.lat,
         longitude=args.lon,
         device_profile=args.device_profile,
-        geo_accuracy_m=args.geo_accuracy_m,
+        geo_accuracy_m=args.geo_accuracy_m, 
+        device=args.device, 
         browser=args.browser,
+        country=args.country,
+        locale=auto_locale,
     ) as sess:
         for identifier, id_type in ids:
             safe_id = sanitize_id_for_path(identifier, id_type)
@@ -2525,6 +2806,17 @@ def build_parser() -> argparse.ArgumentParser:
     
     add_common_args(p_all)
     p_all.set_defaults(func=cmd_all)
+
+    # --- NEW: interactive login ---
+    p_login = sub.add_parser(
+        "login",
+        help="Open a browser so you can log in to TikTok once and persist cookies.",
+        formatter_class=SmartFormatter,
+    )
+    # Reuse the same common arguments (headless, proxy, device, geo, cookies path, etc.)
+    add_common_args(p_login)
+    p_login.set_defaults(func=cmd_login)
+
 
     # --- Utility: list Playwright device profiles ---
     p_dev = sub.add_parser(
